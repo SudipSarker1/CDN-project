@@ -1,0 +1,5 @@
+{
+  "replicas": [
+    { "name": "ReplicaA", "url": "https://localhost:9001" }
+  ]
+}
