@@ -1,0 +1,11 @@
+node_modules/
+videos/*.mp4
+cert/*.key
+cert/*.crt
+cert/*.pem
+.env
+dist/
+build/
+coverage/
+.vscode/
+.idea/
