@@ -9,3 +9,13 @@ build/
 coverage/
 .vscode/
 .idea/
+# ignore media only, keep replica code
+replicas/**/videos/
+*.mp4
+__pycache__/
+**/__pycache__/
+*.pyc
+.venv/
+replicas/**/videos/
+*.mp4
+.DS_Store
