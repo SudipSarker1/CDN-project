@@ -19,3 +19,7 @@ __pycache__/
 replicas/**/videos/
 *.mp4
 .DS_Store
+__pycache__/
+**/__pycache__/
+replicas/**/videos/
+*.mp4
