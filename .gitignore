@@ -9,3 +9,9 @@ build/
 coverage/
 .vscode/
 .idea/
+__pycache__/
+**/__pycache__/
+.venv/
+replicas/**/videos/
+*.mp4
+.DS_Store
