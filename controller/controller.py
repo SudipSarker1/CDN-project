@@ -1,82 +1,160 @@
-# controller/controller.py
 from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
-import itertools
+import asyncio
 import json
-import pathlib
+import logging
+from itertools import count
+from pathlib import Path
+from typing import Iterable, List, Optional
+
 import httpx
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 
-app = FastAPI(title="controller (HTTP/3-ready)")
+BASE_DIR = Path(__file__).resolve().parent.parent
+CONFIG_FILE = BASE_DIR / "config" / "replicas.json"
 
-# ---------- Load replica list ----------
-CONFIG = pathlib.Path("config/replicas.json")
-if CONFIG.exists():
-    _cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
-    REPLICAS = _cfg.get("replicas", [])
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+log = logging.getLogger("controller")
+
+with CONFIG_FILE.open("r", encoding="utf-8-sig") as f:
+    data = json.load(f)
+if isinstance(data, dict) and "replicas" in data:
+    replicas: List[str] = [str(u).rstrip("/") for u in data["replicas"]]
+elif isinstance(data, list):
+    replicas = [str(u).rstrip("/") for u in data]
 else:
-    REPLICAS = []
+    raise RuntimeError("config/replicas.json must be a list or an object with 'replicas'")
+if not replicas:
+    raise RuntimeError("replicas list is empty")
+log.info("Loaded replicas: %s", replicas)
 
-# Fallback if config missing/empty: two local replicas on HTTP
-if not REPLICAS:
-    REPLICAS = [
-        {"name": "ReplicaA", "url": "http://127.0.0.1:9101"},
-        {"name": "ReplicaB", "url": "http://127.0.0.1:9102"},
-    ]
+# ---- health monitor (async) ----
+HEALTH: dict[str, bool] = {r: True for r in replicas}
+CHECK_INTERVAL = 5.0  # seconds
+HEALTH_TIMEOUT = httpx.Timeout(3.0, connect=1.0)
 
-_rr = itertools.cycle(REPLICAS)
+async def _check_once():
+    async with httpx.AsyncClient(http2=False, verify=False, timeout=HEALTH_TIMEOUT) as c:
+        for r in replicas:
+            ok = False
+            try:
+                resp = await c.get(f"{r}/healthz")
+                ok = (200 <= resp.status_code < 300)
+            except Exception:
+                ok = False
+            HEALTH[r] = ok
 
+async def health_task():
+    while True:
+        await _check_once()
+        await asyncio.sleep(CHECK_INTERVAL)
 
-# ---------- Optional: advertise HTTP/3 and HTTP/2 via Alt-Svc ----------
+_rr = count(0)
+def next_index() -> int: return next(_rr) % len(replicas)
+
+def healthy_cycle(start_idx: int) -> Iterable[str]:
+    # prefer healthy replicas; if none healthy, try all
+    healthy = [r for r in replicas if HEALTH.get(r, False)]
+    pool = healthy if healthy else list(replicas)
+    n = len(pool)
+    for k in range(n):
+        yield pool[(start_idx + k) % n]
+
+app = FastAPI(title="CDN Controller")
+
+@app.on_event("startup")
+async def _startup():
+    asyncio.create_task(health_task())
+
 @app.middleware("http")
-async def advertise_h3(request: Request, call_next):
+async def add_alt_svc_header(request: Request, call_next):
     resp = await call_next(request)
-    # Tell clients that this same host also serves HTTP/3 on :8443 and HTTP/2 on :8000
-    # (Browsers will learn this and upgrade to QUIC/H3 next requests.)
-    resp.headers["Alt-Svc"] = 'h3=":8443"; ma=86400, h2=":8000"; ma=86400'
+    resp.headers.setdefault("Alt-Svc", 'h3=":8443"; ma=86400, h2=":8000"; ma=86400')
     return resp
 
-
 @app.get("/healthz")
-async def healthz():
-    return {"status": "ok"}
+async def healthz() -> dict:
+    return {"ok": True, "replicas": replicas, "health": HEALTH}
 
+def _normalize_name(video_id: str) -> str:
+    return video_id if video_id.endswith(".mp4") else f"{video_id}.mp4"
 
-# ---------- Proxy endpoint: client stays on controller URL ----------
-@app.get("/videos/{video_name}")
-async def proxy_video(video_name: str, request: Request):
-    if not video_name:
-        raise HTTPException(status_code=400, detail="video name required")
-
-    # Round-robin choose a replica and build its URL
-    target = next(_rr)["url"].rstrip("/") + f"/videos/{video_name}"
-
-    # Forward byte-range header if the browser asks for partial content
-    fwd_headers = {}
-    if "range" in request.headers:
-        fwd_headers["range"] = request.headers["range"]
-
-    # Stream from replica to client; keep controller in the data path
-    # httpx doesn't speak H3 yet; replicas can be HTTP/1.1 or HTTP/2 (http2=False here is very stable on Windows)
-    async with httpx.AsyncClient(http2=False, timeout=None) as client:
+async def _fetch_bytes(url: str, hdrs: dict) -> Response | None:
+    timeout = httpx.Timeout(60.0, connect=10.0)
+    async with httpx.AsyncClient(http2=False, verify=False, timeout=timeout) as client:
         try:
-            r = await client.stream("GET", target, headers=fwd_headers)
-        except httpx.HTTPError as e:
-            raise HTTPException(status_code=502, detail=f"replica fetch error: {e!s}")
+            r = await client.get(url, headers=hdrs)
+        except Exception as e:
+            log.warning("Replica request failed: %s -> %s", url, e)
+            return None
 
-        # Allow 200 or 206; pass through 404/416; treat others as bad gateway
-        if r.status_code in (404, 416):
-            detail = (await r.aread()).decode("utf-8", "ignore")
-            raise HTTPException(status_code=r.status_code, detail=detail)
-        if r.status_code not in (200, 206):
-            await r.aclose()
-            raise HTTPException(status_code=502, detail=f"replica status {r.status_code}")
+        # Accept 200, 206 (content) and 304 (not modified)
+        if r.status_code not in (200, 206, 304):
+            log.info("Replica returned %s for %s (body preview=%r)", r.status_code, url, r.text[:200])
+            return None
 
-        # Propagate key headers for video playback
-        passthrough = {}
-        for h in ("content-type", "content-length", "content-range", "accept-ranges"):
-            if h in r.headers:
-                passthrough[h] = r.headers[h]
+        h: dict[str, str] = {}
+        for k in ("content-type", "content-length", "content-range", "accept-ranges", "last-modified", "etag", "cache-control"):
+            if k in r.headers:
+                h[k.title()] = r.headers[k]
 
-        return StreamingResponse(r.aiter_bytes(), status_code=r.status_code, headers=passthrough)
+        return Response(content=r.content if r.status_code != 304 else b"",  # no body on 304
+                        status_code=r.status_code,
+                        headers=h,
+                        media_type=r.headers.get("content-type", "application/octet-stream"))
+
+@app.get("/videos/{video_id}")
+async def get_video(
+    video_id: str,
+    range: Optional[str] = Header(None),
+    if_none_match: Optional[str] = Header(None, alias="If-None-Match"),
+    if_modified_since: Optional[str] = Header(None, alias="If-Modified-Since"),
+) -> Response:
+    remote_name = _normalize_name(video_id)
+    start = next_index()
+    tried: List[str] = []
+
+    fwd_headers: dict[str, str] = {}
+    if range: fwd_headers["Range"] = range
+    if if_none_match: fwd_headers["If-None-Match"] = if_none_match
+    if if_modified_since: fwd_headers["If-Modified-Since"] = if_modified_since
+
+    for base in healthy_cycle(start):
+        url = f"{base}/videos/{remote_name}"
+        tried.append(url)
+        resp = await _fetch_bytes(url, fwd_headers)
+        if resp is not None:
+            return resp
+
+    detail = f"All replicas failed for {remote_name}. Tried: {', '.join(tried)}"
+    log.error(detail)
+    raise HTTPException(status_code=502, detail=detail)
+
+@app.head("/videos/{video_id}")
+async def head_video(video_id: str) -> Response:
+    remote = _normalize_name(video_id)
+    start = next_index()
+    timeout = httpx.Timeout(20.0, connect=5.0)
+    async with httpx.AsyncClient(http2=False, verify=False, timeout=timeout) as client:
+        for base in healthy_cycle(start):
+            url = f"{base}/videos/{remote}"
+            try:
+                r = await client.request("HEAD", url)
+            except Exception:
+                continue
+            if r.status_code == 200:
+                headers = {
+                    "Accept-Ranges": r.headers.get("accept-ranges", "bytes"),
+                    "Content-Type": r.headers.get("content-type", "video/mp4"),
+                }
+                if "content-length" in r.headers:
+                    headers["Content-Length"] = r.headers["content-length"]
+                if "etag" in r.headers:
+                    headers["ETag"] = r.headers["etag"]
+                if "last-modified" in r.headers:
+                    headers["Last-Modified"] = r.headers["last-modified"]
+                if "cache-control" in r.headers:
+                    headers["Cache-Control"] = r.headers["cache-control"]
+                return Response(status_code=200, headers=headers)
+
+    raise HTTPException(status_code=404, detail=f"{remote} not found on any replica")

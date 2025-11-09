@@ -1,6 +1,4 @@
-{
-  "replicas": [
-    { "name": "ReplicaA", "url": "http://127.0.0.1:9101" },
-    { "name": "ReplicaB", "url": "http://127.0.0.1:9102" }
-  ]
-}
+[
+  "https://localhost:9101",
+  "https://localhost:9102"
+]

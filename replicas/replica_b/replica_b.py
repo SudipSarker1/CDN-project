@@ -9,7 +9,7 @@ import os
 import json
 import email.utils as eut  # RFC 1123 http-date formatting
 
-app = FastAPI(title="Replica A")
+app = FastAPI(title="Replica B")
 
 # Storage
 BASE = Path(__file__).resolve().parent
@@ -62,7 +62,7 @@ def _headers_common(path: Path, ttl: int, extra_version: int) -> dict:
 
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "replica": "A", "videos_dir": str(VIDEOS_DIR), "ttl": DEFAULT_TTL}
+    return {"ok": True, "replica": "B", "videos_dir": str(VIDEOS_DIR), "ttl": DEFAULT_TTL}
 
 @app.post("/upload")
 async def upload_video(request: Request, video_id: str = Header(..., alias="video-id")):

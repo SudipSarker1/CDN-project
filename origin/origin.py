@@ -1,62 +1,84 @@
-import json, pathlib, time
-from typing import Dict, List
-import httpx
+# origin/origin.py
+from __future__ import annotations
+import json, sys
+from pathlib import Path
+from typing import List
+import httpx  # sync client
 
-VIDEOS_DIR = pathlib.Path("videos")
-CONFIG_PATH = pathlib.Path("config/replicas.json")
+# Paths
+BASE_DIR   = Path(__file__).resolve().parents[1]
+CONFIG     = BASE_DIR / "config" / "replicas.json"
+VIDEOS_DIR = BASE_DIR / "videos"
+UPLOAD_PATH = "/upload"  # replicas expect POST /upload with header: video-id
 
-def load_replicas() -> List[Dict]:
-    if CONFIG_PATH.exists():
-        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+def load_replicas() -> List[str]:
+    if not CONFIG.exists():
+        print(f"[origin] ERROR: missing config file: {CONFIG}", file=sys.stderr)
+        sys.exit(2)
+    # tolerate BOM if present
+    data = json.loads(CONFIG.read_text(encoding="utf-8-sig"))
+    if isinstance(data, dict):
         reps = data.get("replicas", [])
+    elif isinstance(data, list):
+        reps = data
     else:
-        reps = []
+        print("[origin] ERROR: replicas.json must be a list or an object with 'replicas'", file=sys.stderr)
+        sys.exit(2)
+    reps = [str(r).rstrip("/") for r in reps]
     if not reps:
-        # default to A/B on HTTP (aligns with controller fallback)
-        reps = [
-            {"name": "ReplicaA", "url": "http://127.0.0.1:9101"},
-            {"name": "ReplicaB", "url": "http://127.0.0.1:9102"},
-        ]
+        print("[origin] ERROR: replicas list is empty", file=sys.stderr)
+        sys.exit(2)
     return reps
 
-def upload_one(client: httpx.Client, url: str, video_path: pathlib.Path, video_id: str, who: str, retries: int = 3):
-    tries = 0
-    while True:
-        tries += 1
-        try:
-            with video_path.open("rb") as f:
-                files = {"file": (video_path.name, f, "video/mp4")}
-                headers = {"video-id": video_id}  # matches replicas' Header(alias="video-id")
-                resp = client.post(url, headers=headers, files=files)
-            if resp.status_code == 200:
-                print(f"  OK -> {who}: {resp.json()}")
-            else:
-                print(f"  ERROR {resp.status_code} -> {who}: {resp.text}")
-            break
-        except (httpx.WriteError, httpx.TransportError) as e:
-            if tries <= retries:
-                print(f"  WARN -> {who}: {e!s} — retry {tries}/{retries}")
-                time.sleep(0.5 * tries)
-                continue
-            print(f"  FAIL -> {who}: {e!s}")
-            break
+def find_videos() -> List[Path]:
+    if not VIDEOS_DIR.exists():
+        print(f"[origin] ERROR: missing videos dir: {VIDEOS_DIR}", file=sys.stderr)
+        sys.exit(2)
+    files = sorted(VIDEOS_DIR.glob("*.mp4"))
+    if not files:
+        print(f"[origin] ERROR: no .mp4 files found in {VIDEOS_DIR}", file=sys.stderr)
+        sys.exit(2)
+    return files
+
+def upload_one(replica: str, path: Path) -> tuple[bool, str]:
+    vid = path.stem
+    url = f"{replica}{UPLOAD_PATH}"
+    headers = {"video-id": vid, "content-type": "application/octet-stream"}
+    try:
+        with path.open("rb") as f:
+            r = httpx.post(url, headers=headers, content=f, timeout=60.0, verify=False)
+        if r.status_code in (200, 201, 204, 409):
+            return True, f"OK ({r.status_code})"
+        return False, f"HTTP {r.status_code} {r.text[:120]}"
+    except Exception as e:
+        return False, f"EXC {type(e).__name__}: {e}"
 
 def main():
-    replicas = load_replicas()
-    mp4s = sorted(VIDEOS_DIR.glob("*.mp4"))
-    if not mp4s:
-        print("No .mp4 files found in ./videos. Add a small test file first.")
-        return
+    reps = load_replicas()
+    files = find_videos()
 
-    # Use HTTP/1.1 on Windows to avoid occasional h2 reset quirks
-    limits = httpx.Limits(max_keepalive_connections=2, max_connections=5)
-    with httpx.Client(http2=False, timeout=None, limits=limits) as client:
-        for video_path in mp4s:
-            vid = video_path.stem
-            print(f"Uploading {vid} ({video_path.name})")
-            for r in replicas:
-                url = r["url"].rstrip("/") + "/upload"
-                upload_one(client, url, video_path, vid, r["name"])
+    print(f"[origin] Using replicas: {', '.join(reps)}")
+    print(f"[origin] Videos dir    : {VIDEOS_DIR}")
+    print(f"[origin] Files to send : {', '.join(p.name for p in files)}")
+    print("--------------------------------------------------")
+
+    ok = 0
+    fail = 0
+    for rep in reps:
+        for p in files:
+            success, msg = upload_one(rep, p)
+            status = "SUCCESS" if success else "FAIL"
+            print(f"[origin] {status}: {rep} <- {p.name}  [{msg}]")
+            ok += 1 if success else 0
+            fail += 0 if success else 1
+
+    print("\n[origin] Upload summary")
+    print("--------------------------------------------------")
+    print(f"  Success: {ok}")
+    print(f"  Failed : {fail}")
+
+    if fail:
+        sys.exit(2)
 
 if __name__ == "__main__":
     main()
