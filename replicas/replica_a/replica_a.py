@@ -1,5 +1,5 @@
 # replicas/replica_a/replica_a.py
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.responses import StreamingResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
@@ -7,11 +7,15 @@ from hashlib import md5
 import mimetypes
 from email.utils import formatdate
 
-# ==== CORS ====
+# ==== CORS (frontend origin) ====
 ALLOWED_ORIGINS = ["https://localhost:3000"]
 EXPOSE_HEADERS = [
-    "Accept-Ranges", "Content-Range", "ETag", "Last-Modified",
-    "Cache-Control", "Content-Length"
+    "Accept-Ranges",
+    "Content-Range",
+    "ETag",
+    "Last-Modified",
+    "Cache-Control",
+    "Content-Length",
 ]
 
 
@@ -23,16 +27,17 @@ def _corsify_headers(h: dict | None) -> dict:
 
 
 app = FastAPI(title="Replica A")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
-    allow_methods=["GET", "HEAD", "OPTIONS"],
+    allow_methods=["GET", "HEAD", "OPTIONS", "POST"],
     allow_headers=["*"],
     expose_headers=EXPOSE_HEADERS,
 )
 
-# Alt-Svc to advertise HTTP/3 on 9101
+# Alt-Svc so clients know this port supports HTTP/3
 @app.middleware("http")
 async def add_alt_svc(request: Request, call_next):
     response = await call_next(request)
@@ -40,7 +45,7 @@ async def add_alt_svc(request: Request, call_next):
     return response
 
 
-# Video directory relative to this file
+# Video folder relative to this file
 BASE_DIR = Path(__file__).resolve().parent
 VIDEOS_DIR = BASE_DIR / "videos"
 
@@ -52,8 +57,42 @@ def options_video(name: str):
 
 @app.get("/healthz")
 def healthz():
+    """Used by controller + origin to check if this replica is healthy."""
     return JSONResponse({"ok": True}, headers=_corsify_headers({}))
 
+
+# ---------- ORIGIN PUSH ENTRYPOINT ----------
+
+@app.post("/upload")
+async def upload_video(
+    request: Request,
+    video_id: str = Header(..., alias="video-id"),
+):
+    """
+    Called by the origin. Saves the uploaded video as videos/{video_id}.mp4
+    """
+    try:
+        data = await request.body()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"failed to read body: {e!s}")
+
+    if not data:
+        raise HTTPException(status_code=400, detail="empty upload body")
+
+    VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
+    target = (VIDEOS_DIR / f"{video_id}.mp4").resolve()
+
+    # keep uploads inside VIDEOS_DIR only
+    if not str(target).startswith(str(VIDEOS_DIR)):
+        raise HTTPException(status_code=400, detail="invalid video-id")
+
+    with target.open("wb") as f:
+        f.write(data)
+
+    return {"ok": True, "stored_as": target.name, "size": len(data)}
+
+
+# ---------- VIDEO STREAMING TO CLIENTS ----------
 
 def _headers_for_file(p: Path) -> dict:
     st = p.stat()
@@ -84,18 +123,22 @@ def _iter_file(p: Path, start: int, end: int, chunk: int = 512 * 1024):
 
 @app.get("/videos/{name}")
 async def get_video(name: str, request: Request):
-    # Expecting name like "sample.mp4"
+    """
+    Serves full or partial (Range) video content.
+    This is what the browser hits after the controller redirect.
+    """
     p = (VIDEOS_DIR / name).resolve()
     if not p.exists() or not str(p).startswith(str(VIDEOS_DIR)):
-        raise HTTPException(404, "not found")
+        raise HTTPException(status_code=404, detail="not found")
 
     h_base = _headers_for_file(p)
     size = p.stat().st_size
     rng = request.headers.get("range")
 
+    # Handle Range: bytes=start-end
     if rng and rng.startswith("bytes="):
         try:
-            part = rng.split("=")[1]
+            part = rng.split("=", 1)[1]
             s, e = part.split("-", 1)
             start = int(s) if s else 0
             end = int(e) if e else size - 1
@@ -110,9 +153,10 @@ async def get_video(name: str, request: Request):
                 headers=headers,
             )
         except Exception:
-            # Fall through to full file
+            # If parsing fails, fall back to full file below
             pass
 
+    # Full file response
     headers = dict(h_base)
     headers["Content-Length"] = str(size)
     return StreamingResponse(
