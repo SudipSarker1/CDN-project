@@ -7,7 +7,7 @@ from hashlib import md5
 import mimetypes
 from email.utils import formatdate
 
-ALLOWED_ORIGINS = ["https://localhost:3000"]
+ALLOWED_ORIGINS = ["https://localhost:3443"] # UPDATED to 3443
 EXPOSE_HEADERS = [
     "Accept-Ranges",
     "Content-Range",
@@ -39,9 +39,9 @@ app.add_middleware(
 
 @app.middleware("http")
 async def add_alt_svc(request: Request, call_next):
-    # Advertise HTTP/3 on :9102
+    # Advertise HTTP/3 on :9442 (UPDATED from 9102)
     response = await call_next(request)
-    response.headers["Alt-Svc"] = 'h3=":9102"; ma=86400'
+    response.headers["Alt-Svc"] = 'h3=":9442"; ma=86400'
     return response
 
 

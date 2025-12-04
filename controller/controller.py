@@ -17,7 +17,8 @@ logger = logging.getLogger("controller")
 logging.basicConfig(level=logging.INFO)
 
 # ==== CORS config (frontend origin) ====
-ALLOWED_ORIGINS = ["https://localhost:3000"]
+# UPDATED: Allow the Frontend on its new port 3443
+ALLOWED_ORIGINS = ["https://localhost:3443"]
 EXPOSE_HEADERS = [
     "Accept-Ranges",
     "Content-Range",
@@ -78,8 +79,8 @@ app.add_middleware(
 @app.middleware("http")
 async def add_alt_svc(request: Request, call_next):
     response = await call_next(request)
-    # Adjust port if you move controller away from 8000
-    response.headers["Alt-Svc"] = 'h3=":8000"; ma=86400'
+    # UPDATED: Advertises the new controller port 8443
+    response.headers["Alt-Svc"] = 'h3=":8443"; ma=86400'
     return response
 
 

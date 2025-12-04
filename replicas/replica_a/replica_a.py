@@ -8,7 +8,10 @@ import mimetypes
 from email.utils import formatdate
 
 # ==== CORS (frontend origin) ====
-ALLOWED_ORIGINS = ["https://localhost:3000"]
+# Note: Since the frontend is now on 3443, ALLOWED_ORIGINS should ideally be updated, 
+# but since it's a localhost setup, keeping it as is should work if 3000 is still running,
+# but for correctness, assume it should be 3443:
+ALLOWED_ORIGINS = ["https://localhost:3443"] 
 EXPOSE_HEADERS = [
     "Accept-Ranges",
     "Content-Range",
@@ -37,11 +40,11 @@ app.add_middleware(
     expose_headers=EXPOSE_HEADERS,
 )
 
-# Alt-Svc so clients know this port supports HTTP/3
+# Alt-Svc so clients know this port supports HTTP/3 (UPDATED to 9441)
 @app.middleware("http")
 async def add_alt_svc(request: Request, call_next):
     response = await call_next(request)
-    response.headers["Alt-Svc"] = 'h3=":9101"; ma=86400'
+    response.headers["Alt-Svc"] = 'h3=":9441"; ma=86400'
     return response
 
 
